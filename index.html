@@ -1,169 +1,290 @@
+'use strict'
 
-<!doctype html>
-<html>
-<head>
-  <title>Page Sandbox</title>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=0">
-  <base target="_blank">
-  <style>
-    body {
-      padding: 0 0.5em;
-    }
-    .box {
-      margin-top: 1em;
-    }
-    #txtURL {
-      width: 100%;
-      height: 2em;
-      text-indent: 0.5em;
-      padding: 0.25em 0;
-    }
-    #btnGo {
-      width: 100%;
-      font-size: 1.5em;
-    }
-    #list a {
-      margin: 1em;
-    }
-  </style>
-</head>
-<body>
-  <div class="box">
-    <input id="txtURL" type="text" value="www.google.com" autofocus>
-  </div>
-  <div class="box">
-    <button id="btnGo">Go</button>
-  </div>
-  <div class="box">
-    <span>切换线路:</span>
-    <select id="selNode"></select>
-  </div>
-  <div class="box" id="list">
-  </div>
-  <script>
-    const PAGE_CONF_SET = 110
-    const PAGE_CONF_GET = 111
+/**
+* static files (404.html, sw.js, conf.js)
+*/
+const ASSET_URL = 'https://etherdream.github.io/jsproxy'
 
-    const SW_CONF_RETURN = 112
-    const SW_CONF_CHANGE = 113
+const JS_VER = 10
+const MAX_RETRY = 1
 
-    const PAGE_READY_CHECK = 200
-    const SW_READY = 201
+/** @type {RequestInit} */
+const PREFLIGHT_INIT = {
+  status: 204,
+  headers: new Headers({
+    'access-control-allow-origin': '*',
+    'access-control-allow-methods': 'GET,POST,PUT,PATCH,TRACE,DELETE,HEAD,OPTIONS',
+    'access-control-max-age': '1728000',
+  }),
+}
 
-    const sw = navigator.serviceWorker
+/**
+* @param {any} body
+* @param {number} status
+* @param {Object<string, string>} headers
+*/
+function makeRes(body, status = 200, headers = {}) {
+  headers['--ver'] = JS_VER
+  headers['access-control-allow-origin'] = '*'
+  return new Response(body, {status, headers})
+}
 
 
-    sw.addEventListener('message', onSwMsg)
-    sendMsgToSw(PAGE_READY_CHECK)
-
-    btnGo.onclick = function() {
-      const text = txtURL.value.trim()
-      if (text) {
-        const url = './-----' + text
-        open(url, '_blank', 'noopener,noreferrer')
-      }
-    }
-    txtURL.onkeypress = function(e) {
-      if (e.keyCode === 13) {
-        btnGo.onclick()
-      }
-    }
-    txtURL.setSelectionRange(0, txtURL.value.length)
+/**
+* @param {string} urlStr 
+*/
+function newUrl(urlStr) {
+  try {
+    return new URL(urlStr)
+  } catch (err) {
+    return null
+  }
+}
 
 
-    function onSwMsg(e) {
-      const [cmd, msg] = e.data
+addEventListener('fetch', e => {
+  const ret = fetchHandler(e)
+    .catch(err => makeRes('cfworker error:\n' + err.stack, 502))
+  e.respondWith(ret)
+})
 
-      switch (cmd) {
-      case SW_CONF_RETURN:
-        conf = msg
-        showConf()
+
+/**
+* @param {FetchEvent} e 
+*/
+async function fetchHandler(e) {
+  const req = e.request
+  const urlStr = req.url
+  const urlObj = new URL(urlStr)
+  const path = urlObj.href.substr(urlObj.origin.length)
+
+  if (urlObj.protocol === 'http:') {
+    urlObj.protocol = 'https:'
+    return makeRes('', 301, {
+      'strict-transport-security': 'max-age=99999999; includeSubDomains; preload',
+      'location': urlObj.href,
+    })
+  }
+
+  if (path.startsWith('/http/')) {
+    return httpHandler(req, path.substr(6))
+  }
+
+  switch (path) {
+  case '/http':
+    return makeRes('请更新 cfworker 到最新版本!')
+  case '/ws':
+    return makeRes('not support', 400)
+  case '/works':
+    return makeRes('it works')
+  default:
+    // static files
+    return fetch(ASSET_URL + path)
+  }
+}
+
+
+/**
+* @param {Request} req
+* @param {string} pathname
+*/
+function httpHandler(req, pathname) {
+  const reqHdrRaw = req.headers
+  if (reqHdrRaw.has('x-jsproxy')) {
+    return Response.error()
+  }
+
+  // preflight
+  if (req.method === 'OPTIONS' &&
+      reqHdrRaw.has('access-control-request-headers')
+  ) {
+    return new Response(null, PREFLIGHT_INIT)
+  }
+
+  let acehOld = false
+  let rawSvr = ''
+  let rawLen = ''
+  let rawEtag = ''
+
+  const reqHdrNew = new Headers(reqHdrRaw)
+  reqHdrNew.set('x-jsproxy', '1')
+
+  // 此处逻辑和 http-dec-req-hdr.lua 大致相同
+  // https://github.com/EtherDream/jsproxy/blob/master/lua/http-dec-req-hdr.lua
+  const refer = reqHdrNew.get('referer')
+  const query = refer.substr(refer.indexOf('?') + 1)
+  if (!query) {
+    return makeRes('missing params', 403)
+  }
+  const param = new URLSearchParams(query)
+
+  for (const [k, v] of Object.entries(param)) {
+    if (k.substr(0, 2) === '--') {
+      // 系统信息
+      switch (k.substr(2)) {
+      case 'aceh':
+        acehOld = true
         break
-
-      case SW_CONF_CHANGE:
-        conf = msg
-        updateSelected()
-        break
-
-      case SW_READY:
-        console.log('sw ready')
-        showIcons()
-        sendMsgToSw(PAGE_CONF_GET)
+      case 'raw-info':
+        [rawSvr, rawLen, rawEtag] = v.split('|')
         break
       }
-    }
-
-    function onSwFail(err) {
-      txtURL.value = err
-    }
-
-    selNode.onchange = function() {
-      const item = this.options[this.selectedIndex]
-      const node = item.value
-      conf.node_default = node
-      sendMsgToSw(PAGE_CONF_SET, conf)
-    }
-
-    function sendMsgToSw(cmd, val) {
-      const ctl = sw.controller
-      if (!ctl) {
-        console.log('ctl is null')
-        return
-      }
-      ctl.postMessage([cmd, val])
-    }
-
-    const SITE_LIST = [
-      ['google', ''],
-      ['youtube', ''],
-      ['twitter', 'twitter.com/google'],
-      ['flickr', ''],
-      ['quora', 'www.quora.com/topic/JavaScript-programming-language'],
-      ['twitch', 'www.twitch.tv/'],
-      ['reddit', ''],
-      ['wiki', 'zh.wikipedia.org/'],
-      ['gist', 'gist.github.com/'],
-      ['facebook', 'facebook.com/Google/'],
-      ['blogger', ''],
-    ]
-
-    function showIcons() {
-      list.innerHTML = SITE_LIST.map(v => {
-        let [id, url] = v
-        url = url || `www.${id}.com/`
-        return `\
-<a rel="noopener noreferrer" href=./-----https://${url}>\
-<img width=128 height=128 src=__sys__/assets/ico/${id}.png></a>`
-      }).join('')
-    }
-
-    function addNodeItem(id, text) {
-      const optEl = document.createElement('option')
-      optEl.id = '--' + id
-      optEl.text = text
-      optEl.value = id
-      selNode.appendChild(optEl)
-    }
-
-    function updateSelected() {
-      const id = conf.node_default
-      const item = document.getElementById('--' + id)
-      if (item) {
-        item.selected = true
+    } else {
+      // 还原 HTTP 请求头
+      if (v) {
+        reqHdrNew.set(k, v)
       } else {
-        console.warn('unknown node:', id)
+        reqHdrNew.delete(k)
       }
     }
+  }
+  if (!param.has('referer')) {
+    reqHdrNew.delete('referer')
+  }
 
-    function showConf() {
-      for (const [id, node] of Object.entries(conf.node_map)) {
-        if (!node.hidden) {
-          addNodeItem(id, node.label)
+  // cfworker 会把路径中的 `//` 合并成 `/`
+  const urlStr = pathname.replace(/^(https?):\/+/, '$1://')
+  const urlObj = newUrl(urlStr)
+  if (!urlObj) {
+    return makeRes('invalid proxy url: ' + urlStr, 403)
+  }
+
+  /** @type {RequestInit} */
+  const reqInit = {
+    method: req.method,
+    headers: reqHdrNew,
+    redirect: 'manual',
+  }
+  if (req.method === 'POST') {
+    reqInit.body = req.body
+  }
+  return proxy(urlObj, reqInit, acehOld, rawLen, 0)
+}
+
+
+/**
+* 
+* @param {URL} urlObj 
+* @param {RequestInit} reqInit 
+* @param {number} retryTimes 
+*/
+async function proxy(urlObj, reqInit, acehOld, rawLen, retryTimes) {
+  const res = await fetch(urlObj.href, reqInit)
+  const resHdrOld = res.headers
+  const resHdrNew = new Headers(resHdrOld)
+
+  let expose = '*'
+  
+  for (const [k, v] of resHdrOld.entries()) {
+    if (k === 'access-control-allow-origin' ||
+        k === 'access-control-expose-headers' ||
+        k === 'location' ||
+        k === 'set-cookie'
+    ) {
+      const x = '--' + k
+      resHdrNew.set(x, v)
+      if (acehOld) {
+        expose = expose + ',' + x
+      }
+      resHdrNew.delete(k)
+    }
+    else if (acehOld &&
+      k !== 'cache-control' &&
+      k !== 'content-language' &&
+      k !== 'content-type' &&
+      k !== 'expires' &&
+      k !== 'last-modified' &&
+      k !== 'pragma'
+    ) {
+      expose = expose + ',' + k
+    }
+  }
+
+  if (acehOld) {
+    expose = expose + ',--s'
+    resHdrNew.set('--t', '1')
+  }
+
+  // verify
+  if (rawLen) {
+    const newLen = resHdrOld.get('content-length') || ''
+    const badLen = (rawLen !== newLen)
+
+    if (badLen) {
+      if (retryTimes < MAX_RETRY) {
+        urlObj = await parseYtVideoRedir(urlObj, newLen, res)
+        if (urlObj) {
+          return proxy(urlObj, reqInit, acehOld, rawLen, retryTimes + 1)
         }
       }
-      updateSelected()
+      return makeRes(res.body, 400, {
+        '--error': `bad len: ${newLen}, except: ${rawLen}`,
+        'access-control-expose-headers': '--error',
+      })
     }
-  </script>
-</body>
-</html>
+
+    if (retryTimes > 1) {
+      resHdrNew.set('--retry', retryTimes)
+    }
+  }
+
+  let status = res.status
+
+  resHdrNew.set('access-control-expose-headers', expose)
+  resHdrNew.set('access-control-allow-origin', '*')
+  resHdrNew.set('--s', status)
+  resHdrNew.set('--ver', JS_VER)
+
+  resHdrNew.delete('content-security-policy')
+  resHdrNew.delete('content-security-policy-report-only')
+  resHdrNew.delete('clear-site-data')
+
+  if (status === 301 ||
+      status === 302 ||
+      status === 303 ||
+      status === 307 ||
+      status === 308
+  ) {
+    status = status + 10
+  }
+
+  return new Response(res.body, {
+    status,
+    headers: resHdrNew,
+  })
+}
+
+
+/**
+* @param {URL} urlObj 
+*/
+function isYtUrl(urlObj) {
+  return (
+    urlObj.host.endsWith('.googlevideo.com') &&
+    urlObj.pathname.startsWith('/videoplayback')
+  )
+}
+
+/**
+* @param {URL} urlObj 
+* @param {number} newLen 
+* @param {Response} res 
+*/
+async function parseYtVideoRedir(urlObj, newLen, res) {
+  if (newLen > 2000) {
+    return null
+  }
+  if (!isYtUrl(urlObj)) {
+    return null
+  }
+  try {
+    const data = await res.text()
+    urlObj = new URL(data)
+  } catch (err) {
+    return null
+  }
+  if (!isYtUrl(urlObj)) {
+    return null
+  }
+  return urlObj
+}
